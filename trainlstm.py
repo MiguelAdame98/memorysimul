@@ -13,7 +13,7 @@ import pickle
 
 
 # Device configuration
-device = torch.device("cuda")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 seq_length = 70
 batch_size = 25
 embed_size = 300
@@ -29,11 +29,16 @@ def load_hf_dataset(max_vocab_size=10000):
     vocab = build_vocab(dataset["train"], tokenizer, max_vocab_size)
     return dataset, vocab, tokenizer
 
-# Build vocabulary with a size cap
 def build_vocab(dataset, tokenizer, max_vocab_size):
-    tokens = [tokenizer.tokenize(preprocess_text(line)) for line in dataset["text"]]
-    flat_tokens = [item for sublist in tokens for item in sublist]
-    token_counts = Counter(flat_tokens)
+    token_counts = Counter()
+
+    # Batch processing for better performance
+    batch_texts = [preprocess_text(line) for line in dataset["text"]]
+    tokenized_output = tokenizer.batch_encode_plus(batch_texts, add_special_tokens=False)
+
+    for tokens in tokenized_output["input_ids"]:
+        token_counts.update(tokens)
+
     most_common = token_counts.most_common(max_vocab_size)
     vocab = {token: idx for idx, (token, _) in enumerate(most_common)}
     vocab["<unk>"] = len(vocab)  # Add unknown token
@@ -93,43 +98,70 @@ if __name__ == "__main__":
         batch_size=batch_size,
         shuffle=True,
         pin_memory=True,
-        num_workers=0  # Disable multiprocessing
+        num_workers = min(4, os.cpu_count(),
+        persistent_workers=True) 
     )
     print(len(train_loader))
     # Model setup
     vocab_size = len(vocab)
     model = LSTMTextModel(vocab_size, embed_size=300, hidden_size=512, num_layers=3, dropout=0.5).to(device)
+    if torch.__version__ >= "2.0":
+        model = torch.compile(model)
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate,weight_decay=1e-5)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.5)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.5)
     scaler = torch.amp.GradScaler(enabled=(device.type in ["cuda", "mps"]))
 
-    # Training loop
-    def train_model():
-        model.train()
-        for epoch in range(num_epochs):
-            total_loss = 0
-            for batch_idx, (inputs, targets) in enumerate(train_loader):
-                inputs, targets = inputs.to(device), targets.to(device)
-                hidden = model.init_hidden(inputs.size(0))
+def train_model():
+    model.train()
+    start_epoch = 0  # Track where to resume from
+    checkpoint_path = "lstm_checkpoint.pth"
 
-                optimizer.zero_grad()
-                with autocast(device_type=device.type):
-                    outputs, hidden = model(inputs, hidden)
-                    loss = criterion(outputs.view(-1, vocab_size), targets.view(-1))
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
+    # Load checkpoint if available
+    if os.path.exists(checkpoint_path):
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        start_epoch = checkpoint["epoch"] + 1  # Resume from the next epoch
+        print(f"Resumed from checkpoint, starting from epoch {start_epoch}")
 
-                total_loss += loss.item()
-                if batch_idx % 1000 == 0:
-                    print(f"Epoch {epoch+1}, Batch {batch_idx}, Loss: {loss.item():.4f}")
+    for epoch in range(start_epoch, num_epochs):
+        total_loss = 0
+        for batch_idx, (inputs, targets) in enumerate(train_loader):
+            inputs, targets = inputs.to(device), targets.to(device)
+            hidden = model.init_hidden(inputs.size(0)) 
+            hidden = tuple(h.detach() for h in hidden)
 
-            avg_loss = total_loss / len(train_loader)
-            print(f"Epoch {epoch + 1}, Avg Loss: {avg_loss:.4f}")
-            scheduler.step()
+            optimizer.zero_grad()
+            with autocast(device_type=device.type):
+                outputs, hidden = model(inputs, hidden)
+                loss = criterion(outputs.view(-1, vocab_size), targets.view(-1))
+            
+            scaler.scale(loss).backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5)
+            scaler.step(optimizer)
+            scaler.update()
 
-    train_model()
+            total_loss += loss.item()
+            if batch_idx % 1000 == 0 and batch_idx != 0:
+                print(f"Epoch {epoch+1}, Batch {batch_idx}/{len(train_loader)}, Loss: {loss.item():.4f}")
+
+        avg_loss = total_loss / len(train_loader)
+        print(f"Epoch {epoch + 1}, Avg Loss: {avg_loss:.4f}")
+        scheduler.step()
+
+        # Save checkpoint after every epoch
+        torch.save({
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scaler_state_dict": scaler.state_dict(),
+            "vocab_size": vocab_size
+        }, checkpoint_path)
+        print(f"Checkpoint saved at epoch {epoch + 1}")
+
+train_model()
+
 
 torch.save({
     "model_state_dict": model.state_dict(),
