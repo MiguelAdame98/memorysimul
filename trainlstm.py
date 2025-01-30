@@ -20,7 +20,7 @@ embed_size = 300
 hidden_size = 500
 num_layers = 3
 learning_rate = 0.005
-num_epochs = 10
+num_epochs = 1
 
 # Load WikiText-2 dataset using Hugging Face
 def load_hf_dataset(max_vocab_size=10000):
